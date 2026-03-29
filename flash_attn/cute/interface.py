@@ -1262,7 +1262,13 @@ def _flash_attn_bwd(
     else:
         dQ_semaphore = None
 
-    if deterministic and qhead_per_kvhead > 1 and arch // 10 not in [8, 12]:
+    if (
+        deterministic
+        and qhead_per_kvhead > 1
+        and arch // 10 not in [8, 12]
+        and score_mod is None
+        and score_mod_bwd is None
+    ):
         dK_semaphore = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded // n_block_size, 2, dtype=torch.int32, device=device)
         dV_semaphore = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded // n_block_size, 2, dtype=torch.int32, device=device)
     else:
