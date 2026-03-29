@@ -1153,12 +1153,23 @@ def _flash_attn_bwd(
         pack_gqa = qhead_per_kvhead > 1
     # pack_gqa backward not yet supported in bwd
     pack_gqa = False
+    softcap_score_mod = False
+    if softcap != 0.0:
+        assert score_mod is None and score_mod_bwd is None, (
+            "softcap and score_mod/score_mod_bwd cannot be used together"
+        )
+        score_mod = utils.create_softcap_scoremod(softcap)
+        score_mod_bwd = utils.create_softcap_scoremod_bwd(softcap)
+        softcap = 0.0
+        softcap_score_mod = True
+
     if score_mod is not None:
         assert score_mod_bwd is not None, "score_mod_bwd is required when score_mod is provided"
         assert softcap == 0.0, "softcap and score_mod are mutually exclusive (different log2 scaling)"
-        assert cu_seqlens_q is None and cu_seqlens_k is None, (
-            "varlen + score_mod not supported in bwd yet"
-        )
+        if not softcap_score_mod:
+            assert cu_seqlens_q is None and cu_seqlens_k is None, (
+                "varlen + score_mod not supported in bwd yet"
+            )
 
     device = q.device
     out_torch_dtype = q.dtype
@@ -1389,27 +1400,50 @@ def _flash_attn_bwd(
             for t in (dQ_semaphore, dK_semaphore, dV_semaphore)
         ]
         if arch // 10 in [8, 12]:
-            flash_bwd_obj_cls = FlashAttentionBackwardSm120 if arch // 10 == 12 else FlashAttentionBackwardSm80
-            fa_bwd_obj = flash_bwd_obj_cls(
-                dtype,
-                head_dim,
-                head_dim_v,
-                qhead_per_kvhead,
-                m_block_size,
-                n_block_size,
-                num_stages_Q,
-                num_stages_dO,
-                num_threads,
-                pack_gqa,
-                causal,
-                SdP_swapAB,
-                dKV_swapAB,
-                dQ_swapAB,
-                AtomLayoutMSdP,
-                AtomLayoutNdKV,
-                AtomLayoutMdQ,
-                V_in_regs=V_in_regs,
-            )
+            if arch // 10 == 12:
+                fa_bwd_obj = FlashAttentionBackwardSm120(
+                    dtype,
+                    head_dim,
+                    head_dim_v,
+                    qhead_per_kvhead,
+                    m_block_size,
+                    n_block_size,
+                    num_stages_Q,
+                    num_stages_dO,
+                    num_threads,
+                    pack_gqa,
+                    causal,
+                    SdP_swapAB,
+                    dKV_swapAB,
+                    dQ_swapAB,
+                    AtomLayoutMSdP,
+                    AtomLayoutNdKV,
+                    AtomLayoutMdQ,
+                    V_in_regs=V_in_regs,
+                )
+            else:
+                fa_bwd_obj = FlashAttentionBackwardSm80(
+                    dtype,
+                    head_dim,
+                    head_dim_v,
+                    qhead_per_kvhead,
+                    m_block_size,
+                    n_block_size,
+                    num_stages_Q,
+                    num_stages_dO,
+                    num_threads,
+                    pack_gqa,
+                    causal,
+                    SdP_swapAB,
+                    dKV_swapAB,
+                    dQ_swapAB,
+                    AtomLayoutMSdP,
+                    AtomLayoutNdKV,
+                    AtomLayoutMdQ,
+                    V_in_regs=V_in_regs,
+                    score_mod=score_mod,
+                    score_mod_bwd=score_mod_bwd,
+                )
         elif arch // 10 == 9:
             fa_bwd_obj = FlashAttentionBackwardSm90(
                 dtype,
@@ -1464,8 +1498,7 @@ def _flash_attn_bwd(
             sparse_tensors_compile = to_cute_block_sparse_tensors(normalized_block_sparse_tensors)
 
         # TODO: check @can_implement
-        _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
-            fa_bwd_obj,
+        compile_args = [
             q_tensor,
             k_tensor,
             v_tensor,
@@ -1480,7 +1513,8 @@ def _flash_attn_bwd(
             cu_seqlens_k_tensor,
             seqused_q_tensor,
             seqused_k_tensor,
-            None,  # softcap - not yet supported in backward
+        ]
+        compile_args.extend([
             window_size_left,
             window_size_right,
             dQ_semaphore_tensor,
@@ -1489,10 +1523,12 @@ def _flash_attn_bwd(
             cute_aux_tensors,
             sparse_tensors_compile,
             current_stream,
-            options="--enable-tvm-ffi",
+        ])
+        _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
+            fa_bwd_obj, *compile_args, options="--enable-tvm-ffi",
         )
     if not is_fake_mode():
-        _flash_attn_bwd.compile_cache[compile_key](
+        runtime_args = [
             q.detach(),
             k.detach(),
             v.detach(),
@@ -1507,7 +1543,8 @@ def _flash_attn_bwd(
             cu_seqlens_k,
             seqused_q,
             seqused_k,
-            None,  # softcap - not yet supported in backward
+        ]
+        runtime_args.extend([
             window_size_left,
             window_size_right,
             dQ_semaphore,
@@ -1515,7 +1552,8 @@ def _flash_attn_bwd(
             dV_semaphore,
             aux_tensors,
             normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
-        )
+        ])
+        _flash_attn_bwd.compile_cache[compile_key](*runtime_args)
 
     if arch // 10 == 9:
         # dQ postprocess: match main kernel's MMA WG count, unless dQ_single_wg
@@ -1706,7 +1744,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, dlse):
         q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
-        assert ctx.softcap == 0.0
         if not ctx.return_lse:
             dlse = None
         if dout is None:
