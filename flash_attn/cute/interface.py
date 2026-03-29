@@ -1257,12 +1257,12 @@ def _flash_attn_bwd(
     dtype = torch2cute_dtype_map[q.dtype]
     current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
-    if deterministic:
+    if deterministic and arch // 10 not in [8, 12]:
         dQ_semaphore = torch.zeros(batch_size, num_head, seqlen_q_rounded // m_block_size, cluster_size, dtype=torch.int32, device=device)
     else:
         dQ_semaphore = None
 
-    if deterministic and qhead_per_kvhead > 1:
+    if deterministic and qhead_per_kvhead > 1 and arch // 10 not in [8, 12]:
         dK_semaphore = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded // n_block_size, 2, dtype=torch.int32, device=device)
         dV_semaphore = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded // n_block_size, 2, dtype=torch.int32, device=device)
     else:
