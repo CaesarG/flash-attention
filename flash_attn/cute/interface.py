@@ -1266,14 +1266,16 @@ def _flash_attn_bwd(
         deterministic
         and qhead_per_kvhead > 1
         and arch // 10 not in [8, 12]
-        and score_mod is None
-        and score_mod_bwd is None
     ):
         dK_semaphore = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded // n_block_size, 2, dtype=torch.int32, device=device)
         dV_semaphore = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded // n_block_size, 2, dtype=torch.int32, device=device)
     else:
         dK_semaphore = None
         dV_semaphore = None
+
+    dQ_semaphore_blocks = 0 if dQ_semaphore is None else dQ_semaphore.shape[2]
+    dK_semaphore_blocks = 0 if dK_semaphore is None else dK_semaphore.shape[2]
+    dV_semaphore_blocks = 0 if dV_semaphore is None else dV_semaphore.shape[2]
 
     # Preprocess kernel: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum.
     _bwd_preprocess(
@@ -1337,6 +1339,9 @@ def _flash_attn_bwd(
             V_in_regs,
             dQ_single_wg,
             deterministic,
+            dQ_semaphore_blocks,
+            dK_semaphore_blocks,
+            dV_semaphore_blocks,
             cu_seqlens_q is None,
             cu_seqlens_k is None,
             seqused_q is None,
@@ -1370,6 +1375,9 @@ def _flash_attn_bwd(
             cluster_size,
             use_2cta_instrs,
             deterministic,
+            dQ_semaphore_blocks,
+            dK_semaphore_blocks,
+            dV_semaphore_blocks,
             score_mod_hash,
             score_mod_bwd_hash,
             mask_mod_hash,
